@@ -701,3 +701,623 @@ CDC 처리기는 전달받은 변경 데이터를 확인하고 가공한 뒤에 
 
 ### CDC와 데이터 위치
 CDC 처리기는 변경 데이터를 어디까지 처리했는지 기록해야 한다. 예를 들어 MySQL은 바이너리 로그를 이용해서 CDC를 구현하는데, 각 로그 항목은 변경된 데이터와 로그 파일에서의 위치(포지션) 값을 갖는다. 이 위치를 기록해야 CDC 처리기를 재시작할 때 마지막으로 조회한 로그부터 읽어올 수 있다. 이 위치를 기록하지 않으면 마지막 로그 데이터부터 읽어와야 하는데, 이 경우 CDC 처리기를 재시작하는 시간 동안 발생한 변경 데이터를 놓치게 된다.
+
+# 동시성, 데이터가 꼬이기 전에 잡아야 한다
+## 서버와 동시 실행
+서버가 동시에 여러 클라이언트의 요청을 처리하는 방식은 크게 다음 2가지가 있다.
+- 클라이언트 요청마다 스레드를 할당해서 처리
+- 비동기 IO(또는 논블로킹 IO)를 사용해서 처리
+
+요청마다 스레드를 할당하는 방식은 여러 스레드가 동시에 코드를 실행한다. 클라이언트 요청이 동시에 10개 들어오면 10개 스레드가 실행하고, 50개 요청이 들어오면 50개 스레드가 실행하는 식이다. 서버에 따라 클라이언트 요청을 처리할 때 사용할 스레드 개수에 제한을 두기도 하지만, 동시 요청 개수만큼 스레드가 동시에 실행된다.
+
+비동기 IO/논블로킹 IO 방식을 사용할 때에도 단일 스레드만 사용하는 경우는 드물다. IO 요청을 처리하기 위해 여러 스레드를 사용하는 경우가 많다.
+
+어떤 방식을 사용하든 서버는 동시 실행이 기본이다. 서로 다른 두 스레드가 동시에 같은 데이터를 조회하고 수정하는 일이 발생할 수 있다. 동시 실행을 고려하지 않고 코드를 만들면 찾기 어려운 버그가 발생할 수 있다.
+```java
+public class Increaser {
+    private int count = 0;
+
+    public void inc() {
+        count = count + 1;
+    }
+
+    public int getCount() {
+        return count;
+    }
+}
+```
+
+Increaser 클래스는 간단하다. count 필드가 있고 inc() 메서드는 count 필드를 1 증가시킨다. 그런데 이 간단한 코드를 다중 스레드 환경에서 실행하면 count 값이 비정상적으로 바뀌는 문제가 발생할 수 있다. 다음은 문제가 발생하는 예를 보여준다.
+```java
+Increaser increaser = new Increaser();
+Thread[] threads = new Thread[100];
+
+for (int i = 0; i < 100; i++) {
+    Thread t = new Thread(() -> {
+        for (int j = 0; j < 100; j++) {
+            increaser.inc();
+        }
+    });
+    threads[i] = t;
+    t.start();
+}
+
+for (Thread t : threads) {
+    t.join();
+}
+
+System.out.println(increaser.getCount());
+```
+
+이 코드는 동시에 100개의 스레드를 생성한다. 각 스레드는 100번 반복해서 동일한 increaser 객체의 inc() 메서드를 실행한다. 모든 스레드의 실행이 끝난 뒤 getCount()로 count 값을 출력한다. 문제가 없다면 10000을 출력해야 한다. 하지만 여러 번 실행해 보면 9982, 9973처럼 잘못된 값을 출력할 때가 있다.
+
+이런 문제가 발생하는 이유는 여러 스레드가 동시에 `count = count + 1` 코드를 실행하기 때문이다. 이 코드는 실제로 다음 두 단계로 실행된다.
+1. count 값을 읽는다.
+2. 읽은 값에 1을 더한 결과를 count에 저장한다.
+
+예를 들어 count가 5일 때 2개의 스레드가 아래 그림처럼 동시에 실행되면 count는 7이 아니라 6이 된다. 만약 4개 스레드가 동시에 이런 식으로 실행된다면 count는 9가 아닌 6이 될 수 있다. 이 경우 3이 사라진 것이다.
+
+![](/assets/images/jaehoo1/etc/concurrency-example.png)
+
+문제는, 동시성 문제가 항상 바로 드러나는 게 아니라는 점이다. 동시성 문제는 미묘해서 재현이 잘 되지 않는 경우가 많기 때문이다. 그래서 처음부터 동시성 문제를 염두에 두고 개발하는 것이 중요하다.
+
+> ### 경쟁 상태(race condition)
+>
+> 여러 스레드가 동시에 공유 자원에 접근할 때, 접근 순서에 따라 결과가 달라지는 상황을 경쟁 상태(race condition)라고 한다. 경쟁 상태가 발생하면 예상하지 못한 결과가 나오거나 오류가 발생할 수 있다. 앞서 살펴본 count 증가 예제가 전형적인 경쟁 상태의 예다. 여기서 공유 자원은 count 필드이며, 여러 스레드가 count 필드에 접근하는 코드를 어떤 순서로 실행하느냐에 따라 결과가 달라지고 오류가 생긴다.
+
+## 잘못된 데이터 공유로 인한 문제 예시
+```java
+public class PayService {
+    private Long payId;
+
+    public PayResp pay(PayRequest req) {
+        ...
+        this.payId = genPayId();                        // 단계 1
+        saveTemp(this.payId, req);                      // 단계 2
+        PayResp resp = sendPayData(this.payId, ...);    // 단계 3
+        applyResponse(resp);                            // 단계 4
+        return resp;
+    }
+
+    private void applyResponse(PayResp resp) {
+        PayData payData = createPayDataFromResp(resp);  // 단계 4-1
+        updatePayData(this.payId, payData);             // 단계 4-2
+        ...
+    }
+}
+```
+
+이 코드에서 문제가 되는 것은 payId 필드다. 위 코드의 전체 흐름은 다음과 같다.
+- 단계 1 : genPayId()로 생성한 값을 payId 필드에 할당한다.
+- 단계 2 : payId 필드를 이용해서 임시 저장한다.
+- 단계 3 : sendPayData()를 호출하고 리턴 결과를 resp 변수에 저장한다.
+- 단계 4 : applyResponse()를 호출한다.
+  - 단계 4-1 : 파라미터로 받은 resp를 이용해서 PayData를 생성한다.
+  - 단계 4-2 : updatePayData() 메서드에 payId 필드를 전달한다.
+
+PayService 인스턴스가 하나뿐인 싱글톤 객체(예: 스프링 컨테이너의 싱글톤 빈)라고 가정하고, 다중 스레드 환경에서 PayService 객체가 동시에 사용되면, 1단계에서 생성한 payId 값과 4-2단계에서 사용하는 payId 값이 서로 다를 수 있다.
+
+![](/assets/images/jaehoo1/etc/concurrency-singleton-bean.png)
+
+만약 스레드 1과 스레드 2가 각각 고객 A와 고객 B의 요청을 처리하고 있었다면, 고객 A의 결제 결과는 사라진다. 스레드 1이 마지막 단계에서 payId가 2인 데이터를 덮어썼기 때문이다. 반면, 고객 B의 결제 결과에는 고객 A의 응답 결과가 저장되는 문제가 발생한다. 스레드 2가 결제 결과를 정상적으로 처리한 후에, 스레드 1이 payId가 2인 데이터를 다시 덮어쓴 것이다. 그 결과, 한 고객의 결제 결과는 사라지고 다른 고객의 결제에는 잘못된 값이 반영되는 매우 심각한 문제가 생긴다.
+
+DB도 동시성 문제에서 자유롭지 않다. 동시성을 고려하지 않으면 데이터 일관성에 문제가 생길 수 있다.
+
+![](/assets/images/jaehoo1/etc/concurrency-on-db-update.png)
+
+위  그림은 관리자와 고객이 동시에 주문 정보를 변경할 때 발생할 수 있는 상황을 보여준다. 관리자는 주문 상태를 배송으로 변경하고, 고객은 동시에 같은 주문을 취소하고 있다. DB 관점에서 보면 주문 서비스가 주문을 취소 상태로 변경한 다음(과정 2.2) 관리 시스템이 이어서 해당 주문을 다시 배송 상태로 변경하는 상황이 발생한다(과정 1.2). 고객은 주문을 취소했는데 시스템상으로는 배송이 시작되는 문제가 생기는 것이다.
+
+여러 스레드나 프로세스가 동시에 같은 데이터를 수정할 때 발생하는 동시성 문제는 전형적인 실수다. 단순한 실수처럼 보일 수 있지만 동시성에 대한 학습과 경험이 부족하면 이런 문제를 쉽게 놓칠 수 있다.
+
+## 프로세스 수준에서의 동시 접근 제어
+[앞서 살펴본 두 사례](#잘못된-데이터-공유로-인한-문제-예시)에서 보듯이 동시성 문제는 프로세스 수준과 DB 수준 모두에서 검토해야 한다. 먼저 단일 프로세스 내에서 동시성을 다룰 때 필요한 기초적인 개념부터 알아보자.
+
+### 잠금(lock)을 이용한 접근 제어
+프로세스 수준에서 데이터를 동시에 수정하는 것을 막기 위한 일반적인 방법은 잠금(lock)을 사용하는 것이다. 잠금을 사용하면 공유 자원에 접근하는 스레드를 한 번에 하나로 제한할 수 있다. 잠금을 사용하는 일반적인 흐름은 다음과 같다.
+1. 잠금을 획득함
+2. 공유 자원에 접근(임계 영역)
+3. 잠금을 해제함
+
+> ### 임계 영역(Critical Section)
+>
+> 임계 영역은 동시에 둘 이상의 스레드나 프로세스가 접근하면 안 되는 공유 자원에 접근하는 코드 영역을 말한다. 공유 자원의 예로는 메모리나 파일이 있다.
+
+잠금은 한 번에 한 스레드만 획득할 수 있다. 여러 스레드가 동시에 잠금 획득을 시도하면 그중 하나만 획득하고 나머지 스레드는 잠금이 해제될 때까지 대기하게 된다. 잠금을 획득한 스레드는 공유 자원에 접근한 뒤 사용을 마치면 잠금을 해제한다. 잠금이 해제되면 대기 중이던 스레드 중 하나가 잠금을 획득해 자원에 접근한다.
+
+![](/assets/images/jaehoo1/etc/lock-on-multi-thread.png)
+
+다음은 잠금을 사용해 동시에 `HashMap`을 수정할 때 발생할 수 있는 문제를 방지하는 간단한 자바 코드이다.
+```java
+public class UserSessions {
+    private Lock lock = new ReentrantLock();
+    private Map<String, UserSession> sessions = new HashMap<>();
+
+    public void addUserSession(UserSession session) {
+        lock.lock();    // 잠금을 획득할 때까지 대기
+        try {
+            sessions.put(session.getSessionId(), session);  // 공유 자원 접근
+        } finally {
+            lock.unlock();  // 잠금 해제
+        }
+    }
+
+    public UserSession getUserSession(String sessionId) {
+        lock.lock();
+        try {
+            retrun sessions.get(sessionId);
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+```
+
+이 코드는 `ReentrantLock`을 사용해서 sessions 필드에 대한 동시 접근을 제한한다. `HashMap`은 다중 스레드 환경에서 안전하지 않다. 동시에 여러 스레드가 `HashMap`의 `put()` 메서드를 호출하면 데이터가 유실되거나 값이 잘못 저장되는 문제가 발생할 수 있다. 이런 문제를 방지하기 위해 잠금(`ReentrantLock`)을 사용해서 sessions 필드에 한 번에 한 스레드만 접근할 수 있도록 제한한 것이다.
+
+> ### `synchronized`와 `ReentrantLock`
+>
+> `synchronized` 키워드를 사용하면 더 간단하게 스레드의 동시 접근을 제어할 수 있다. 코드 블록이 끝나면 자동으로 잠금을 풀어주기 때문에 `unlock()`과 같은 메서드를 호출할 필요도 없다.
+>
+> 반면에 `ReentrantLock`은 `synchronized`에는 없는 기능을 제공한다. 대표적인 예가 잠금 획득 대기 시간을 지정하는 기능이다. 그리고 자바 21 버전에 추가된 가상 스레드가 아직은 `ReentrantLock`만 지원하고 `synchronized`는 자바 24버전부터 지원하고 있다.
+>
+> `synchronized`와 `ReentrantLock` 중에서 무엇을 사용해도 문제는 없다. 원하는 기능을 구현하는 데 적당한 잠금 구현을 사용하면 된다. 단, 두 방식을 섞어서 사용하지는 말고 가능하면 한 가지 방식으로 통일한다.
+
+실제로 잠금이 제대로 동작하는지 확인하기 위해 아래의 테스트를 만들어 볼 수 있다.
+```java
+class UserSessionsTest {
+    @Test
+    void concurrentTest() {
+        ExecutorService executor = Executors.newFixedThreadPool(500);
+        UserSessions userSessions = new UserSessions();
+
+        List<Future<?>> futures = new ArrayList<>();
+        int sessionCount = 1_000;
+        for (int i = 1; i <= sessionCount; i++) {
+            String sessionId = "session-" + i;
+            Future<?> future = executor.submit(() -> {
+                UserSession userSession = new UserSession(sessionId);
+                userSessions.addUserSession(userSession);
+            });
+            futures.add(future);
+        }
+        futures.forEach(f -> {
+            try {
+                f.get();
+            } catch (Exception e) {
+                log.error("error", e);
+            }
+        });
+
+        executor.shutdown();
+
+        for (int i = 1; i <= sessionCount; i++) {
+            String sessionId = "session-" + i;
+            UserSession userSession = userSessions.getUserSession(sessionId);
+            assertThat(userSession)
+                    .describedAs("session %s", sessionId)
+                    .isNotNull();
+        }
+    }
+}
+```
+
+동시에 500개 작업을 실행할 수 있는 `ExecutorService`를 생성한다. 동시성 문제가 없는지 검증할 UserSessions 객체를 생성한다.
+
+1000개의 UserSession 객체를 UserSessions에 추가한다. `executor.submit()`로 실행할 코드를 전달하는데, `executor`는 500개 스레드를 이용해서 동시에 실행하므로 거의 동시에 500개의 UserSession 객체를 UserSessions에 추가한다.
+
+앞서 실행한 100개의 작업이 끝날 때까지 기다린다. UserSessions 객체에 UserSession 객체가 정상적으로 추가됐는지 검증한다. 실제로 이 테스트를 실행하면 테스트가 통과된다.
+
+잠금을 사용하지 않으면 어떻게 되는지 확인해보고 싶다면 UserSessions의 addUserSession() 메서드를 다음과 같이 바꿔보자.
+```java
+public void addUserSession(UserSession session) {
+    sessions.put(session.getSessionId(), session);  // 잠금 없이 HashMap.put 실행
+}
+```
+
+이 코드는 잠금 없이 `HashMap`의 `put()`을 실행한다. 테스트를 실행하면 다음과 같이 테스트가 실패하는 것을 확인할 수 있다.
+```text
+java.lang.AssertionError: [session session-xxx]
+    Expecting actual not to be null
+```
+
+위 실패 메시지는 session-xxx번 UserSession 객체가 없어서 검증에 실패했다고 알려주는데, 실행할 때마다 누락되는 UserSession 객체가 바뀐다. 이는 동시성 문제의 결과가 매번 다르다는 것을 뜻한다.
+
+> ### 뮤텍스(mutex)
+>
+> 뮤텍스(mutex)는 mutual exclusion의 줄임말인데 **뮤텍스를 다른 말로 잠금(lock)이라고도 한다.** 프로그래밍 언어에 따라 뮤텍스를 사용하기도 하고 잠금을 사용하기도 한다. 예를 들어 자바 언어는 이름이 `Lock`인 타입을 사용하고 Go 언어는 이름이 `Mutex`인 타입을 사용하고 있다.
+
+### 동시 접근 제어를 위한 구성 요소
+자바의 `ReentrantLock`은 한 번에 1개 스레드만 잠금을 구할 수 있다. 즉, 한 번에 한 스레드만 공유 자원에 접근할 수 있다. 나머지 스레드는 잠금이 해제될 때까지 대기해야 한다.
+
+잠금 외에도 동시 접근을 제어하기 위한 구성 요소로 [세마포어](#세마포어)와 [읽기 쓰기 잠금](#읽기-쓰기-잠금)이 있다.
+
+### 세마포어
+세마포어(Semaphore)는 **동시에 실행할 수 있는 스레드 수를 제한**한다. **자원에 대한 접근을 일정 수준으로 제한**하고 싶을 때 세마포어를 사용할 수 있다. 예를 들면, 외부 서비스에 대한 동시 요청을 최대 5개로 제한하고 싶을 때 세마포어를 사용할 수 있다.
+
+세마포어는 허용 가능한 숫자를 이용해서 생성한다. 이 숫자를 자바 세마포어 구현체는 퍼밋(permit)이라고 표현하며, Go 언어의 세마포어 구현체는 weight라고 표현한다.
+
+> 세마포어에는 이진(binary) 세마포어와 계수(counting) 세마포어가 있다. 이진 세마포어는 동시에 접근할 수 있는 스레드가 1개인 반면 계수 세마포어는 지정한 수만큼 동시 접근이 가능하다.
+
+세마포어를 사용하는 전형적인 순서는 다음과 같다.
+1. 세마포어에서 퍼밋 획득(허용 가능 숫자 1 감소)
+2. 코드 실행
+3. 세마포어에 퍼밋 반환(허용 가능 숫자 1 증가)
+
+각 스레드는 세마포어에서 퍼밋을 획득한 뒤에 코드를 실행할 수 있다. 퍼밋 획득에 성공하면 세마포어의 남아 있는 퍼밋 개수가 1 감소한다. 남아 있는 퍼밋 개수가 0인 상태에서 퍼밋을 획득하려는 스레드는 다른 스레드가 퍼밋을 반환할 때까지 대기하게 된다.
+
+> 세마포어에서 퍼밋을 구하고 반환하는 연산을 각각 P 연산(또는 wait 연산), V 연산(또는 signal 연산)이라고 한다.
+
+세마포어를 사용해서 동시 실행 스레드를 제한하는 코드 예
+```java
+import java.util.concurrent.Semaphore;
+
+public class MyClient {
+    private Semaphore semaphore = new Semaphore(5);
+    
+    public String getData() {
+        try {
+            semaphore.acquire();    // 퍼밋 획득 시도
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+        try {
+            String data = ...   // 외부 연동 코드
+            return data;
+        } finally {
+            semaphore.release();    // 퍼밋 반환
+        }
+    }
+}
+```
+
+허용 개수를 5로 지정한 세마포어를 생성했기 때문에, 동시에 최대 5개 스레드까지만 실행할 수 있다.
+
+### 읽기 쓰기 잠금
+```java
+public void addUserSession(UserSession session) {
+    lock.lock();
+    try {
+        sessions.put(session.getSessionId(), session);
+    } finally {
+        lock.unlock();
+    }
+}
+
+public UserSession getUserSession(String sessionId) {
+    lock.lock();
+    try {
+        return sessions.get(sessionId); // 한 번에 한 스레드만 읽기 가능
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+이 코드에서 addUserSession()과 getUserSession()은 동일한 잠금을 사용한다. 따라서 session에 동시에 `put()`하거나 `get()`을 할 수 없다. 오직 한 스레드만 `put()`을 하거나 `get()`을 할 수 있다.
+
+그런데 `HashMap`이 바뀌지만 않는다면 `get()` 메서드는 여러 스레드가 동시에 실행해도 문제되지 않는다. `get()` 메서드를 실행하는 동안 `put()` 메서드를 사용해서 변경할 때가 문제가 된다. 즉 `get()`과 `put()`을 동시에 실행하지 않고 `get()`만 동시 실행하는 것은 문제가 되지 않는다.
+
+잠금을 사용하면 데이터를 변경하지 않더라도 동시에 읽기가 안 된다. 한 번에 1개 스레드만 읽기 기능을 실행할 수 있기 때문이다. 한 번에 한 스레드만 읽기가 가능하므로 쓰기 빈도 대비 읽기 빈도가 높을 때에는 읽기 성능이 떨어지는 문제가 발생할 수 있다.
+
+읽기 쓰기 잠금을 사용하면 이런 성능상 단점을 없애면서 잠금을 통해 데이터 동시 접근 문제를 없앨 수 있다. 읽기 쓰기 잠금은 다음 특징을 갖는다.
+- 쓰기 잠금은 한 번에 한 스레드만 구할 수 있다.
+- 읽기 잠금은 한 번에 여러 스레드가 구할 수 있다.
+- 한 스레드가 쓰기 잠금을 획득했다면 쓰기 잠금이 해제될 때까지 읽기 잠금을 구할 수 없다.
+- 읽기 잠금을 획득한 모든 스레드가 읽기 잠금을 해제할 때까지 쓰기 잠금을 구할 수 없다.
+
+위 특징에 따라 읽기 쓰기 잠금을 사용하면 쓰는 동안 읽기를 할 수 없고 읽는 동안 쓰기를 할 수 없다. 또한 동시에 여러 스레드가 읽기를 실행할 수 있다. 따라서 읽기 쓰기 잠금을 사용하면 잠금을 사용했을 때 발생하는 읽기 성능 문제를 완화할 수 있다.
+```java
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class UserSessionRW {
+    private ReadWriteLock lock = new ReentrantReadWriteLock();
+    private Lock writeLock = lock.writeLock();
+    private Lock readLock = lock.readLock();
+    private Map<String, UserSession> sessions = new HashMap<>();
+
+    public void addUserSession(UserSession session) {
+        writeLock.lock();
+        try {
+            sessions.put(session.getSessionId(), session);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    public UserSession getUserSession(String sessionId) {
+        readLock.lock();
+        try {
+            return sessions.get(sessionId);
+        } finally {
+            readLock.unlock();
+        }
+    }
+}
+```
+
+`ReadWriteLock`을 생성하고 쓰기용 잠금과 읽기용 잠금을 얻는다. addUserSession() 메서드는 데이터를 변경하므로 쓰기 잠금을 사용해 동시 접근을 제어한다. 반면 getUserSession() 메서드는 데이터를 조회하므로 읽기 잠금을 사용해 여러 스레드가 동시에 읽기를 수행할 수 있도록 했다.
+
+### 원자적 타입(Atomic Type)
+이 코드는 스레드가 동시에 데이터를 변경할 때 발생하는 문제를 설명할 때 사용한 코드이다.
+```java
+public class Increaser {
+    private int count = 0;
+
+    public void inc() {
+        count = count + 1;
+    }
+}
+```
+
+다음 코드처럼 잠금을 사용하면 동시성 문제를 해결할 수 있다.
+```java
+public class Increaser {
+    private Lock lock = new ReentrantLock();
+    private int count = 0;
+
+    public void inc() {
+        lock.lock();
+        try {
+            count = count + 1;
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+```
+
+잠금을 사용하면 카운터 증가에 대한 동시성 문제를 간단하게 해결할 수 있다. 하지만 이 방식을 사용하면 CPU 효율이 떨어지는 단점이 있다. 여러 스레드가 동시에 실행할 때 잠금을 확보한 스레드를 제외한 나머지 스레드는 대기하기 때문이다.
+
+잠금을 사용하지 않으면서 동시성 문제없이 카운터를 구현하는 다른 방법이 존재하는데, 그 방법은 바로 원자적 타입을 사용하는 것이다. 자바 언어를 예로 들면 `AtomicInteger`, `AtomicLong`, `AtomicBoolean`과 같은 타입이 존재한다. 이 타입을 사용하면 다중 스레드 환경에서 동시성 문제없이 여러 스레드가 공유하는 데이터를 변경할 수 있다.
+
+`AtomicInteger`를 이용해서 Increaser 클래스를 구현한 예
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Increaser {
+    private AtomicInteger count = new AtomicInteger(0);
+    
+    public void inc() {
+        count.incrementAndGet();    // 다중 스레드 문제없이 값을 1 증가시킴
+    }
+    
+    public int getCount() {
+        return count.get();
+    }
+}
+```
+
+`AtomicInteger`는 내부적으로 CAS 연산을 사용한다. 이를 통해 스레드를 멈추지 않고도 다중 스레드 환경에서 안전하게 값을 변경할 수가 있다. 여러 스레드가 동시에 count.incrementAndGet()을 실행해도 모든 스레드가 멈추지 않고 실행되므로 CPU 효율을 높일 수 있다.
+
+> CAS는 Compare And Swap의 약자로 이름 그대로 비교 후에 교체하는 연산을 말한다.
+
+`AtomicInteger` 클래스의 내부 구현은 잠금을 사용하는 것보다 복잡하지만, 사용하는 입장에서는 `Lock`을 사용하는 것보다 간단하게 동시성 문제를 해결할 수 있다. 동시에 여러 스레드가 `int`, `long`, `boolean` 타입의 공유 데이터를 변경한다면, 잠금 대신 원자적 타입을 사용해서 동시 접근 문제를 간단하게 처리할 수 있다.
+
+### 동시성 지원 컬렉션
+스레드에 안전하지 않은 컬렉션을 여러 스레드가 공유하면 동시성 문제가 발생할 수 있다. 예를 들어 자바에서 `HashMap`이나 `HashSet`을 여러 스레드가 동시에 변경하면 데이터가 깨진다.
+
+이런 문제를 해결하는 방법 중 하나는 동기화된 컬렉션을 사용하는 것이다. 즉, 데이터를 변경하는 모든 연산에 잠금을 적용해서 한 번에 한 스레드만 접근할 수 있도록 제한하는 것이다. 자바의 `Collections` 클래스는 동기화된 컬렉션을 생성하는 메서드를 제공한다. 이 메서드를 사용하면 기존 컬렉션 객체를 쉽게 동기화된 컬렉션 객체로 변환할 수 있다.
+```java
+Map<String, String> map = new HashMap<>();
+// 동기화된 컬렉션 객체 생성
+Map<String, String> syncMap = Collections.synchronizedMap(map);
+syncMap.put("key1", "value1");  // put 메서드는 내부적으로 synchronized로 처리됨
+```
+
+동기화된 컬렉션 객체는 변경이나 조회와 관련된 메서드가 모두 동기화된 블록에서 실행되어 동시성 문제를 해결한다.
+
+> 자바 23 또는 이전 버전 기준으로 가상 스레드를 사용한다면 `Collections.synchronizedMap()`을 포함한 동기화 컬렉션 객체로 변환해주는 메서드를 사용하면 안 된다. 내부적으로 `synchronized`를 사용해서 동시 접근을 동기화하기 때문이다. 자바 23 또는 이전 버전 기준으로 가상 스레드는 아직 `synchronized`를 지원하지 않기에 가상 스레드 환경에서 `Collections.synchronized()` 메서드로 생성한 동기화된 컬렉션을 사용하면 성능에 문제가 생길 수 있다.
+
+동시성 문제를 해결하는 또 다른 방법은 동시성 자체를 지원하는 컬렉션 타입을 사용하는 것이다. 예를 들어 `HashMap` 대신 `ConcurrentHashMap`을 사용할 수 있다.
+```java
+ConcurrentMap<String, String> map = new ConcurrentHashMap<>();
+map.put("key1", "value1");  // 동시성 지원 컬렉션은 잠금 범위를 최소화한다.
+```
+
+`ConcurrentHashMap` 타입은 데이터를 변경할 때 잠금 범위를 최소화한다. 따라서 키의 해시 분포가 고르고 동시 수정이 많으면, 동기화된 맵을 사용하는 것보다 더 나은 성능을 제공한다.
+
+> ### 불변(Immutable) 값
+>
+> 동시성 문제를 피하기 위한 방법 중 하나는 불변(Immutable) 값을 사용하는 것이다. 함수형 프로그래밍을 학습하면 초반에 불변에 대해 배우게 되는데, 불변 값은 말 그대로 바뀌지 않는 값을 의미한다. 값이 바뀌지 않기 때문에 동시에 여러 스레드가 접근해도 문제가 발생하지 않는다. 불변 값은 데이터 변경이 필요한 경우, 기존 값을 수정하는 대신 새로운 값을 생성해서 사용한다. 예를 들어 자바의 `CopyOnWriteArrayList`는 요소를 추가하거나 삭제할 때마다 매번 새로운 리스트를 생성해서 반환한다.
+
+## DB와 동시성
+DB가 제공하는 트랜잭션은 데이터를 다루는 과정에서 발생할 수 있는 다양한 동시성 문제를 처리해준다. 덕분에 개발자가 직접 고민해야 할 데이터 관련 동시성 문제의 범위가 줄어든다.
+
+DB 트랜잭션은 여러 개의 조회나 쓰기를 논리적으로 하나의 연산으로 묶는다. 하나의 트랜잭션에 포함된 모든 쓰기는 모두 적용되거나(커밋) 모두 취소된다(롤백). 트랜잭션 안의 쿼리 중 하나라도 실패하면 전체 트랜젹션을 롤백함으로써 데이터가 깨지는 것을 방지할 수 있다. 하지만 DB 트랜잭션만으로는 모든 동시성 문제를 해결할 수는 없다. DB 데이터를 동시에 수정할 때 발생하는 문제도 있다. 이런 문제를 해결하려면 프로세스 수준에서 잠금을 사용한 것처럼, DB에 맞는 잠금 기능을 활용해야 한다.
+
+(DB마다 차이는 있지만) 대부분의 DB는 명시적인 잠금 기법을 제공한다. 이런 방식은 선점 잠금, 또는 비관적 잠금이라 불린다. 선점 잠금을 사용하면 동일한 레코드에 대해 한 번에 하나의 트랜잭션만 접근할 수 있도록 제어할 수 있다. 반면 값을 비교해서 수정하는 방식은 비선점 잠금, 또는 낙관적 잠금이라고 하며, 쿼리 실행 자체는 막지 않으면서도 데이터가 잘못 변경되는 것을 막을 수 있다.
+
+> ### 비관적, 낙관적
+>
+> '비관적'은 실패할 가능성이 높아서 비관적이다. 다수가 데이터 변경을 시도하면 데이터를 정상적으로 변경할 가능성이 떨어질 테니 이를 비관적이라고 표현한 것이다. '낙관적'은 반대로 성공할 가능성이 높아서 낙관적이다.
+>
+> 실패 가능성이 높은 비관적인 상황에서는 동시성 문제를 해결하기 위해 한 번에 1개 클라이언트만 접근할 수 있는 배타적 잠금을 사용하며, 이게 바로 비관적 잠금이다. 반대로 성공 가능성이 높은 낙관적인 상황에서는 동시성 문제를 해결하기 위해 배타적 잠금까지는 사용하지 않는다. 대신 값을 비교하는 방식으로 동시성 문제에 대응한다. 이는 실제로 잠금을 사용하는 것은 아니지만 비관적 잠금에 대응하는 용어로 낙관적 잠금이라는 용어를 사용한다.
+
+### 선점(비관적) 잠금
+선점 잠금은 데이터에 먼저 접근한 트랜잭션이 잠금을 획득하는 방식이다. 선점 잠금을 획득하기 위한 쿼리는 다음 형식을 갖는다(오라클과 MySQL 기준이며 DB에 따라 쿼리 방식은 다를 수 있다.)
+```sql
+select *
+from table
+where 조건
+for update;
+```
+
+이 쿼리는 조건에 해당하는 레코드를 조회하면서 동시에 잠금을 획득한다. 한 트랜잭션이 특정 레코드에 대한 잠금을 획득한 경우, 잠금을 해제할 때까지 다른 트랜잭션은 동일 레코드에 대한 잠금을 획득하지 못하고 대기해야 한다. 레코드에 대한 잠금은 트랜잭션이 종료될 때(커밋이나 롤백) 반환된다.
+
+![](/assets/images/jaehoo1/etc/pessimistic-lock.png)
+
+트랜잭션 1이 먼저 데이터에 대한 잠금을 구햇다. 트랜잭션 2는 트랜잭션 1이 트랜잭션을 완료해서 잠금을 반환할 때까지 대기하게 된다. 트랜잭션 1이 끝난 뒤에 트랜잭션 2가 잠금을 구하게 되면, 트랜잭션 2는 트랜잭션 1이 변경한 데이터를 조회한다. 이는 두 트랜잭션이 동시에 같은 데이터를 수정하면서 데이터 일관성이 깨지는 문제를 방지해준다.
+
+> ### 분산 잠금
+>
+> 분산 잠금(distributed lock)은 여러 프로세스가 동시에 동일한 자원에 접근하지 못하도록 막는 방법이다. 앞에서 설명한 잠금과 큰 차이는 없지만, 분산 잠금은 여러 프로세스 간에 잠금 처리를 한다는 점에서 차이가 있다.
+>
+> 간단한 분산 잠금이 필요할 때 DB에서 제공하는 선점 잠금을 이용해 구현할 수 있다. 비교적 단순한 코드로 목적에 맞는 분산 잠금을 만들 수 있고, 대부분의 시스템이 DB를 필수로 사용하므로 별도의 도구 없이도 구성할 수 있다는 장점이 있다.
+>
+> 트래픽이 많다면 레디스를 이용해 분산 잠금을 구현하는 것을 고려한다. 레디스를 기반으로 한 분산 잠금 도구들이 잘 만들어져 있기 때문이다. 레디스를 추가로 도입해야 한다는 점은 단점이지만, 이미 레디스를 사용하고 있다면 빠르게 적용할 수 있다.
+
+### 비선점(낙관적) 잠금
+비선점 잠금은 명시적으로 잠금을 사용하지 않는다. 대신 데이터를 조회한 시점의 값과 수정하려는 시점의 값이 같은지 비교하는 방식으로 동시성 문제를 처리한다. 보통 비선점 잠금을 구현할 때는 정수 타입의 버전 칼럼을 사용한다.
+
+버전 칼럼을 이용해서 비선점 잠금을 구현하는 방식은 다음과 같다.
+1. `SELECT` 쿼리를 실행할 때 version 칼럼을 함께 조회한다.
+```sql
+select ..., version
+from table
+where id = #{id};
+```
+2. 로직을 수행한다.
+3. `UPDATE` 쿼리를 실행할 때 version 칼럼을 1 증가시킨다. 이때 version 칼럼 값이 1에서 조회한 값과 같은지 비교하는 조건을 `where` 절에 추가한다.
+```sql
+UPDATE table
+SET ...,
+    version = version + 1
+WHERE id = #{id}
+    and version = [1에서 조회한 version 값];
+```
+4. `UPDATE` 결과로 변경된 행 개수가 0이면, 이미 다른 트랜잭션이 version 값을 증가시킨 것이므로 데이터 변경에 실패한 것이다. 이 경우 트랜잭션을 롤백한다.
+5. `UPDATE` 결과로 변경된 행 개수가 0보다 크면, 다른 트랜잭션보다 먼저 데이터 변경에 성공한 것이므로 트랜잭션을 커밋한다.
+
+아래는 위 과정을 단순한 코드로 표현한 것이다. (실제 구현에서는 DB 연동을 DAO나 `@Repository` 클래스로 분리하지만 여기서는 설명을 위해 쿼리를 직접 표시)
+```java
+@Transactional
+public void startShipping(String orderId) {
+    OrderData order = getOrder(orderId);
+    // ...order 유효한지 검사
+    order.startShipping();  // state를 'SHIPPING'으로 변경
+
+    // UPDATE 쿼리 실행 시 다른 트랜잭션과의 충돌을 막기 위해
+    // 조회한 version을 비교하교 다른 version을 1 증가시킴.
+    int updatedCount = jdbcTemplate.update(
+        "update orders " +
+        "set " +
+            "version = version + 1, " +
+            "state = 'SHIPPING' " +
+        "where id = ? " +
+            "and version = ?",
+        order.getId(),
+        order.getVersion()
+    );
+
+    if (updatedCount == 0) {
+        // 변경에 실패
+        throw new RuntimeException("비선점 잠금 오류 발생 및 트랜잭션 롤백");
+    }
+}
+
+private Order getOrder(String orderId) {
+    return jdbcTemplate.queryForObject("select * from orders where id = ?",
+        (rs, rowNum) -> {
+            return Order.builder()
+                    .id(rs.getString("id"))
+                    .state(rs.getString("state"))
+                    .version(rs.getLong("version"))     // version 조회
+                    .build();
+        }, orderId);
+}
+```
+
+비선점 잠금은 낙관적인 방식이기 때문에 일단 데이터 변경을 시도한다. 이때 조회한 버전 값을 함께 비교해서 데이터가 변경되지 않았는지를 확인한다. 만약 다른 트랜잭션이 먼저 데이터를 변경했다면 버전 값이 달라지기 때문에 `UPDATE` 결과는 0건이 된다. 이 경우에는 데이터 변경에 실패한 것이므로 적절한 오류 처리를 하고 트랜잭션을 롤백한다. 반면 `UPDATE` 결과가 0보다 크다면 조회한 이후로 버전 값이 바뀌지 않았다는 뜻이므로 데이터 변경에 성공한 것이다. 이 경우에는 트랜잭션을 커밋해서 변경 내용을 반영한다.
+
+### 외부 연동과 잠금
+트랜잭션 범위 내에서 외부 시스템과 연동해야 한다면, 비선점 잠금보다는 선점 잠금을 고려하는 것이 좋다. 비선점 잠금을 사용하고 싶다면 [트랜잭션 아웃박스 패턴](#트랜잭션-아웃박스-패턴)을 적용해서 외부 연동을 처리하는 방법도 있다.
+
+### 증분 쿼리
+```java
+// 주제 조회
+Subject subject = jdbcTemplate.queryForObject(
+    "select id, joinCount, ... " +
+    "from SUBJECT " +
+    "where id = ?",
+    매퍼코드, id
+);
+
+// 참여 데이터 추가
+joinToSubject(joinData, subject);   // SUBJECT_JOIN 테이블에 추가
+
+// 주제 데이터의 참여자 수 증가
+jdbcTemplate.update(
+    "update SUBJECT " +
+    "set joinCount = ? " +
+    "where id = ?",
+    subject.getJoinCount() + 1,
+    subject.getId()
+);
+```
+
+위 코드는 참여자 수를 1 증가시키기 위해 SUBJECT 테이블에서 joinCount 값을 조회하고, 그 값에 1을 더해서 다시 joinCount를 갱신한다. 논리적으로는 문제가 없어 보인다. 하지만 동시에 두 명이 이 코드를 실행하면 joinCount는 2가 아니라 1만 증가하는 문제가 발생할 수 있다.
+
+이 문제를 해결하기 위해 선점 잠금을 사용할 수도 있다. 하지만 선점 잠금을 사용하면 잠금 대기 시간만큼 응답 시간이 길어진다. 비선점 잠금을 사용하면 대기 시간은 없지만 변경 실패 에러가 자주 발생할 수 있다.
+
+잠금을 사용하지 않으면서도 참여자 수를 증가시키는 방법이 있다. 바로 증분 쿼리를 사용하는 것이다. 예를 들어 참여자 수를 1 증가시키려면 다음과 같은 쿼리를 사용하면 된다.
+```sql
+update SUBJECT
+set
+    joinCount = joinCount + 1
+where id = #{id};
+```
+
+DB는 joinCount = joinCount + 1을 원자적 연산으로 처리한다. DB는 동일 데이터에 대한 원자적 연산이 동시에 실행될 경우 이를 순차적으로 실행한다. 따라서 데이터가 누락되는 문제가 발생하지 않는다.
+
+> 증분 쿼리는 DBMS에 따라 원자적 연산이 아닐 수도 있다. 따라서 증분 쿼리를 사용할 때는 사용하는 DB에서 원자적으로 처리되는지 반드시 검증해야 한다.
+
+## 잠금 사용 시 주의 사항
+### 잠금 해제하기
+잠금을 획득한 뒤에는 반드시 잠금을 해제해야 한다. 그렇지 않으면 잠금을 시도하는 스레드가 무한정 대기하게 된다. 세마포어도 마찬가지다. 퍼밋을 획득했다면 반드시 퍼밋을 반환해야 한다. 반환하지 않으면 퍼밋을 얻으려는 스레드는 끝없이 대기하게 된다.
+
+잠금을 사용할 때는 습관적으로 `finally` 블록에서 잠금을 해제하는 코드를 작성하자.
+```java
+lock.lock();
+try {
+    // 코드
+} finally {
+    lock.unlock();  // finally는 항상 실행되므로 잠금을 무조건 해제함
+}
+```
+
+### 대기 시간 지정하기
+잠금 획득을 시도하는 코드는 잠금을 구할 수 있을 때까지 계속 대기하는데, 동시 접근이 많아지면 대기 시간이 길어지는 문제가 발생할 수 있다. 예를 들어 임계 영역의 코드 실행에 0.5초가 걸리고 동시에 1000개의 스레드가 잠금을 시도하는 상황을 생각해보자. 처음으로 잠금을 획득한 스레드는 0.5초 만에 코드를 실행할 수 있지만 마지막으로 잠금을 획득한 스레드는 499.5초를 기다려야 실행할 수 있다.
+
+```java
+boolean acquired = lock.tryLock(5, TimeUnit.SECONDS);
+if (!acquired) {
+    // 잠금 획득 실패
+    throw new RuntimeException("Failed to acquire lock");
+}
+// 잠금 획득 성공
+try {
+    // 자원 접근 코드 실행
+} finally {
+    lock.unlock();
+}
+```
+
+이 코드에서 `tryLock()` 메서드는 5초 동안 잠금 획득을 시도한다. 5초 이내에 잠금을 획득하면 `true`를 반환하고, 실패하면 `false`를 반환한다. 잠금을 획득하지 못하면 자원 접근 코드를 실행하지 않고 실패에 대한 처리를 수행한다.
+
+대기 시간 없이 바로 결과를 반환하는 `tryLock()` 메서드도 사용할 수 있다.
+```java
+boolean acquired = lock.tryLock();
+if (!acquired) {
+    // 잠금 획득 실패
+    throw new RuntimeException("Failed to acquire lock");
+}
+```
+
+사용자는 결과를 모른 채 긴 시간 동안 응답을 기다리게 되면 불안감을 느낄 수 있다(계좌 이체를 하는데 몇 분 동안 응답이 없으면 많이 불안할 것이다). 일정 시간 내에 또는 바로 잠금 획득에 실패하면 사용자에게 빠르게 실패 응답을 줄 수 있다. 이는 긴 대기가 초래하는 불안감을 줄여주어 사용자를 안심시키는 데 도움이 된다.
+
+### 교착 상태(deadlock) 피하기
+한 자원에서 다른 자원으로 용량(파일)을 전송하는 기능을 구현한다고 가정해보자. 이 기능을 구현하려면 다음과 같이 두 자원에 대한 잠금이 필요하다.
+- 자원 A 잠금 획득
+- 자원 B 잠금 획득
+- 자원 A 용량 감소
+- 자원 B 용량 증가
+- 자원 B 잠금 해제
+- 자원 A 잠금 해제
+
+이 작업은 두 자원에 대한 잠금을 필요로 한다. 이렇게 한 작업에서 2개 이상의 자원의 잠금을 획득하는 코드 구조는 교착 상태(deadlock)에 빠지기 쉬운 전형적인 패턴이다. 교착 상태는 2개 이상의 스레드가 서로가 획득한 잠금을 대기하면서 무한히 기다리는 상황을 말한다.
+
+![]()
