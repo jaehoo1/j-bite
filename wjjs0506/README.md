@@ -33,10 +33,10 @@ wjjs0506의 학습을 기록하는 공간입니다.
 | Date | Category | Topic | Link |
 | :--- | :--- | :--- | :--- |
 | Kafka | 📁 Etc | with_Spring | [Go](./etc/Kafka_with_Spring.md) |
-| 2026.04.27 | 🗄️ DB | index | [Go](./db/index.md) |
-| 2026.04.20 | 🤖 AI | harness | [Go](./ai/harness.md) |
-| 2026.04.07 | 🔢 Algorithm | PG42576 | [Go](./algorithm/ps/PG42576.md) |
-| 2026.03.29 | ♾️ DevOps | infrastructure | [Go](./devops/infrastructure.md) |
+| 2026.04.28 | 🎤 Interview | java | [Go](./interview/java.md) |
+| 2026.04.28 | 🎤 Interview | spring | [Go](./interview/spring.md) |
+| 2026.04.28 | 🎤 Interview | network | [Go](./interview/network.md) |
+| 2026.04.28 | 🎤 Interview | os | [Go](./interview/os.md) |
 <!-- LOG_TABLE_END -->
 
 ## 🌲 Repository Structure
