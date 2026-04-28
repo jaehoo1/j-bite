@@ -57,6 +57,7 @@ def update_readme(member_folder):
         "NETWORK":   "🌐 Network",
         "OS":        "⚙️ OS",
         "SPRING":    "🍃 Spring",
+        "INTERVIEW": "🎤 Interview",
         "GENERAL":   "📝 General",
     }
 
