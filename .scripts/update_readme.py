@@ -4,12 +4,12 @@ import re
 import subprocess
 
 
-def get_file_add_date(full_path):
+def get_file_add_date(full_path, fmt="%Y.%m.%d"):
     """파일이 최초로 추가(A)된 커밋 날짜를 반환. 수정 커밋은 무시."""
     try:
         result = subprocess.run(
             ['git', 'log', '--diff-filter=A', '--follow', '-1',
-             '--format=%ad', '--date=format:%Y.%m.%d', '--', full_path],
+             '--format=%ad', f'--date=format:{fmt}', '--', full_path],
             capture_output=True, text=True
         )
         date = result.stdout.strip()
@@ -17,12 +17,82 @@ def get_file_add_date(full_path):
             return date
         # untracked 파일(아직 커밋 안 된 신규 파일) 폴백
         result = subprocess.run(
-            ['git', 'log', '-1', '--format=%ad', '--date=format:%Y.%m.%d', '--', full_path],
+            ['git', 'log', '-1', '--format=%ad', f'--date=format:{fmt}', '--', full_path],
             capture_output=True, text=True
         )
         return result.stdout.strip() or "-"
     except Exception:
         return "-"
+
+
+def get_h1_title(full_path):
+    """파일 첫 5줄 내 H1 헤더 텍스트 반환. 없으면 None."""
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        non_empty = [l for l in lines if l.strip()]
+        for line in non_empty[:5]:
+            if line.startswith("# "):
+                return line[2:].strip()
+        return None
+    except Exception:
+        return None
+
+
+CATEGORY_FOLDERS = ["ai", "db", "devops", "etc", "java", "network", "os", "spring"]
+
+
+def update_category_readme(base_path, cat_folder):
+    """카테고리 폴더의 README.md 목차 테이블을 커밋된 파일 기준으로 갱신."""
+    folder_path = os.path.join(base_path, cat_folder)
+    readme_path = os.path.join(folder_path, "README.md")
+
+    if not os.path.exists(readme_path):
+        print(f"Skip: {cat_folder}/README.md 없음")
+        return
+
+    entries = []
+    try:
+        files = os.listdir(folder_path)
+    except Exception:
+        return
+
+    for file in sorted(files):
+        if not file.endswith(".md") or file.upper() == "README.MD":
+            continue
+        full_path = os.path.join(folder_path, file)
+        if not is_valid_study_note(full_path):
+            continue
+        date = get_file_add_date(full_path, fmt="%Y-%m-%d")
+        if date == "-":
+            continue  # 미커밋 파일 제외
+        title = get_h1_title(full_path) or file.replace(".md", "")
+        entries.append({"date": date, "title": title, "file": file})
+
+    entries.sort(key=lambda x: x["date"])
+
+    table_rows = [
+        f"| {i} | {e['title']} | {e['date']} | [바로가기](./{e['file']}) |"
+        for i, e in enumerate(entries, 1)
+    ]
+
+    new_table = (
+        "| 순번 | 제목 | 날짜 | 링크 |\n"
+        "| :---: | :--- | :---: | :---: |\n"
+        + "\n".join(table_rows)
+    )
+
+    with open(readme_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    pattern = r"(<!-- CATEGORY_TABLE_START -->).*?(<!-- CATEGORY_TABLE_END -->)"
+    replacement = f"\\1\n{new_table}\n\\2"
+    updated = re.sub(pattern, replacement, content, flags=re.DOTALL)
+
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(updated)
+
+    print(f"{cat_folder}/README.md updated with {len(entries)} entries.")
 
 
 def is_valid_study_note(full_path):
@@ -61,7 +131,7 @@ def update_readme(member_folder):
         "GENERAL":   "📝 General",
     }
 
-    EXCLUDED_DIRS = {"assets", ".git"}  # assets: 이미지 전용 폴더, 스캔 대상 아님
+    EXCLUDED_DIRS = {"assets", ".git", "interview"}  # assets: 이미지 전용 폴더, interview: README 노출 제외
 
     logs = []
     for root, dirs, files in os.walk(base_path):
@@ -84,8 +154,9 @@ def update_readme(member_folder):
 
             # 파일명 형식: YYMMDD_제목.md 이면 날짜 분리, 아니면 git log 에서 날짜 조회
             stem = file.replace(".md", "")
-            if "_" in stem:
-                date_part, title_part = stem.split("_", 1)
+            date_part = stem.split("_", 1)[0] if "_" in stem else ""
+            if re.match(r'^\d{6}$', date_part):
+                title_part = stem.split("_", 1)[1]
                 date = date_part
                 topic = title_part
             else:
@@ -125,6 +196,9 @@ def update_readme(member_folder):
         f.write(updated)
 
     print(f"README.md updated with {len(logs)} entries (top 5).")
+
+    for cat in CATEGORY_FOLDERS:
+        update_category_readme(base_path, cat)
 
 
 if __name__ == "__main__":
