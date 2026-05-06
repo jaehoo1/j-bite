@@ -32,11 +32,11 @@ wjjs0506의 학습을 기록하는 공간입니다.
 <!-- LOG_TABLE_START -->
 | Date | Category | Topic | Link |
 | :--- | :--- | :--- | :--- |
+| 2026.05.06 | 🔢 Algorithm | Queue의_구현체 | [Go](./algorithm/Queue의_구현체.md) |
 | 2026.04.27 | 🗄️ DB | index | [Go](./db/index.md) |
 | 2026.04.20 | 🤖 AI | harness | [Go](./ai/harness.md) |
 | 2026.04.07 | 🔢 Algorithm | PG42576 | [Go](./algorithm/ps/PG42576.md) |
 | 2026.04.06 | 📁 Etc | Kafka_with_Spring | [Go](./etc/Kafka_with_Spring.md) |
-| 2026.03.29 | ♾️ DevOps | infrastructure | [Go](./devops/infrastructure.md) |
 <!-- LOG_TABLE_END -->
 
 ## 🌲 Repository Structure
