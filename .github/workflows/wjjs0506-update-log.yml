@@ -1,0 +1,57 @@
+name: wjjs0506's README Update
+
+on:
+  push:
+    paths:
+      - 'wjjs0506/**/*.md'
+      - '!wjjs0506/**/README.md'
+      - '!wjjs0506/assets/**'
+
+jobs:
+  update-readme:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commit type
+        id: check
+        run: |
+          MSG="${{ github.event.head_commit.message }}"
+          if echo "$MSG" | grep -qiE "^feat(\(.+\))?:"; then
+            echo "is_feat=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_feat=false" >> $GITHUB_OUTPUT
+            echo "Skipping README update — not a feat: commit (message: $MSG)"
+          fi
+
+      - name: Set up Python
+        if: steps.check.outputs.is_feat == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Update wjjs0506 README
+        if: steps.check.outputs.is_feat == 'true'
+        run: python .scripts/update_readme.py wjjs0506
+
+      - name: Commit and Push changes
+        if: steps.check.outputs.is_feat == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "docs: auto-update wjjs0506 READMEs"
+          file_pattern: >-
+            wjjs0506/README.md
+            wjjs0506/ai/README.md
+            wjjs0506/algorithm/README.md
+            wjjs0506/db/README.md
+            wjjs0506/devops/README.md
+            wjjs0506/etc/README.md
+            wjjs0506/java/README.md
+            wjjs0506/network/README.md
+            wjjs0506/os/README.md
+            wjjs0506/spring/README.md
