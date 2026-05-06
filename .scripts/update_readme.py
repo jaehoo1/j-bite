@@ -39,7 +39,7 @@ def get_h1_title(full_path):
         return None
 
 
-CATEGORY_FOLDERS = ["ai", "db", "devops", "etc", "java", "network", "os", "spring"]
+CATEGORY_FOLDERS = ["ai", "algorithm", "db", "devops", "etc", "java", "network", "os", "spring"]
 
 
 def update_category_readme(base_path, cat_folder):
